@@ -1,0 +1,108 @@
+## monadial/.github weekly re-scan
+##
+## v1 scope: re-scan the digests CURRENTLY DEPLOYED per monadial-cloud's
+## pinned platform manifests (admin-ingresses.yaml, docs.yaml — hello's
+## deploy/values.yaml joins once that repo exists and is deployed). A
+## failure here means a vulnerability disclosed AFTER the original
+## build-time Trivy gate now applies to something already running.
+##
+## This workflow does not talk to Slack itself: CI-failure notification is
+## the GitHub Slack app's job (prerequisite 7 — `/github subscribe
+## monadial/.github workflows:{event:"workflow_run" branch:"main"}`), not
+## something implemented here.
+##
+## Pin provenance: see build.yml's header comment for the re-resolve
+## command; same pins reused here.
+
+name: rescan
+
+# Quoted: bare `on:` is a YAML 1.1 boolean literal (resolves to `true`) —
+# quoting keeps it a string key so strict YAML linters don't flag it.
+# GitHub's own workflow parser accepts either form identically.
+"on":
+  schedule:
+    - cron: "0 6 * * 1"  # every Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  list-images:
+    name: extract pinned digests from monadial-cloud
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      images: ${{ steps.extract.outputs.images }}
+    steps:
+      - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN}" ]; then
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN org secret is missing or empty." >&2
+            echo "This workflow needs it to authenticate to 1Password (vault monadial-cloud)." >&2
+            echo "See WORKFLOWS.md prerequisite 3 — ask an org admin to share the org secret with this repo." >&2
+            exit 1
+          fi
+
+      - name: Load GitHub App credentials from 1Password
+        uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          CI_WRITEBACK_APP_ID: op://monadial-cloud/github-app-ci-writeback/credentials/app_id
+          CI_WRITEBACK_PRIVATE_KEY: op://monadial-cloud/github-app-ci-writeback/credentials/private_key
+
+      - name: Create read-only token for monadial-cloud
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ env.CI_WRITEBACK_APP_ID }}
+          private-key: ${{ env.CI_WRITEBACK_PRIVATE_KEY }}
+          owner: monadial
+          repositories: monadial-cloud
+
+      - name: Sparse checkout pinned manifests
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: monadial/monadial-cloud
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: |
+            gitops/platform/ingress/admin-ingresses.yaml
+            gitops/platform/docs/docs.yaml
+          sparse-checkout-cone-mode: false
+          path: monadial-cloud
+
+      - name: Extract image@sha256 references
+        id: extract
+        run: |
+          refs="$(grep -hoE '[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+@sha256:[a-f0-9]{64}' \
+            monadial-cloud/gitops/platform/ingress/admin-ingresses.yaml \
+            monadial-cloud/gitops/platform/docs/docs.yaml | sort -u)"
+          if [ -z "${refs}" ]; then
+            echo "::error::No image@sha256 references found in the pinned manifests — nothing to re-scan." >&2
+            echo "Either the manifests moved or genuinely nothing is pinned yet; treat as a failure." >&2
+            exit 1
+          fi
+          json="$(printf '%s\n' "${refs}" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+          echo "images=${json}" >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: trivy re-scan
+    needs: list-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.list-images.outputs.images) }}
+    steps:
+      - name: Scan ${{ matrix.image }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"

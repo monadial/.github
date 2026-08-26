@@ -1,0 +1,296 @@
+## monadial/.github reusable build workflow
+##
+## Build -> scan (Trivy, before push) -> push -> sign (cosign, keyless) -> write
+## back the resulting digest into the calling app's deploy manifest in a
+## SEPARATE repository, via a GitHub App installation token (never a repo/org
+## PAT). See ../../WORKFLOWS.md for the full caller contract (required
+## inputs/secrets, the paths-ignore loop-guard callers MUST set, and the
+## action allowlist to paste into org Settings -> Actions -> "Allow select
+## actions").
+##
+## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
+## with the human-readable release tag it currently resolves to as a
+## trailing comment. Re-resolve with:
+##   gh api repos/<owner>/<repo>/commits/<tag> --jq '.sha'
+## (dereferences annotated tags to the commit automatically) before bumping
+## any pin.
+
+name: build
+
+# Quoted: bare `on:` is a YAML 1.1 boolean literal (resolves to `true`) —
+# quoting keeps it a string key so strict YAML linters don't flag it.
+# GitHub's own workflow parser accepts either form identically.
+"on":
+  workflow_call:
+    inputs:
+      image:
+        description: >-
+          Fully-qualified image repository, no tag/digest, e.g.
+          rg.nl-ams.scw.cloud/monadial/hello
+        required: true
+        type: string
+      context:
+        description: Docker build context path, relative to the calling repo root.
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile, relative to the calling repo root.
+        required: true
+        type: string
+      writeback_repo:
+        description: >-
+          owner/repo of the deploy-manifest repository to pin the built
+          digest into, e.g. monadial/hello
+        required: true
+        type: string
+      writeback_path:
+        description: >-
+          Path (within writeback_repo) to the file whose image reference
+          line gets updated to the new digest.
+        required: true
+        type: string
+      writeback_regex:
+        description: >-
+          Extended-regex (grep -E / sed -E compatible) matching the exact
+          image reference line/value in writeback_path to replace. Must
+          match at least one line or the write-back job fails on purpose.
+        required: true
+        type: string
+      platforms:
+        description: Comma-separated buildx platform list. Single-platform only (load+push flow).
+        required: false
+        type: string
+        default: linux/amd64
+      tag:
+        description: >-
+          Tag to build/scan/push under before signing by digest. Defaults
+          to the calling workflow run's commit SHA when not supplied.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        description: >-
+          Org-level 1Password service-account token (read-only, vault
+          monadial-cloud). Required — this workflow authenticates to
+          1Password with it in every job. If the org secret does not
+          exist or is not shared with the calling repo, every job fails
+          fast with an explicit ::error:: rather than a cryptic
+          1Password-CLI auth failure.
+        required: true
+    outputs:
+      digest:
+        description: sha256 digest of the pushed, signed image.
+        value: ${{ jobs.build.outputs.digest }}
+
+# Hygiene default (§11.4): no ambient token permissions anywhere in this
+# workflow unless a job explicitly grants itself what it needs.
+permissions: {}
+
+jobs:
+  build:
+    name: build, scan, push, sign
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # cosign keyless: mints the OIDC token Fulcio exchanges for a cert
+      contents: read  # actions/checkout of the calling repo
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN}" ]; then
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN org secret is missing or empty." >&2
+            echo "This workflow needs it to authenticate to 1Password (vault monadial-cloud)." >&2
+            echo "See WORKFLOWS.md prerequisite 3 — ask an org admin to share the org secret with this repo." >&2
+            exit 1
+          fi
+
+      - name: Load registry push credentials from 1Password
+        uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          SCW_ACCESS_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/access_key
+          SCW_SECRET_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/secret_key
+
+      - name: Determine build tag
+        id: vars
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "${INPUT_TAG}" ]; then
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Docker login (Scaleway registry)
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          registry="${IMAGE%%/*}"
+          echo "${SCW_SECRET_KEY}" | docker login "${registry}" --username "${SCW_ACCESS_KEY}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Build image (local only — nothing pushed yet)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: false
+          load: true
+          tags: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
+
+      - name: Scan with Trivy (gate — must pass before anything is pushed)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          image-ref: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Push image
+        # Same buildx builder instance as the step above (created once by
+        # setup-buildx-action for the whole job) — BuildKit reuses its
+        # local build cache from the scan build, so this is normally a
+        # near-instant re-export/push rather than a full rebuild.
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
+
+      - name: Resolve pushed digest
+        id: digest
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          # Pull (rather than trust the local buildx load) so the local
+          # daemon records RepoDigests against a reference it fetched from
+          # the registry itself.
+          docker pull "${IMAGE}:${TAG}"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${TAG}" | sed -E 's#^.*@##')"
+          if [ -z "${digest}" ]; then
+            echo "::error::Could not resolve a pushed digest for ${IMAGE}:${TAG} — RepoDigests empty after pull." >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+
+      - name: Sign image (keyless)
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          # Keyless: identity = this job's OIDC token (id-token: write
+          # above), Fulcio-issued short-lived cert, Rekor transparency-log
+          # entry. cosign >=2.x bundles the Rekor SET into the signature by
+          # default, so `cosign verify --offline --bundle` works later
+          # without a live Rekor round-trip (§1).
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  writeback:
+    name: write back pinned digest
+    needs: build
+    runs-on: ubuntu-latest
+    # NOT contents:write. contents:write on the GITHUB_TOKEN would only
+    # grant push rights on the repo THIS workflow is running in (the
+    # caller) — irrelevant, since the commit below targets a different
+    # repository (writeback_repo). The actual write authority comes
+    # entirely from the short-lived GitHub App installation token minted
+    # below, scoped by the App install to writeback_repo only. Keeping the
+    # ambient GITHUB_TOKEN at contents:read (unused, but the conservative
+    # non-empty default) means a bug in this job can never fall back to
+    # writing to the calling repo with elevated rights.
+    permissions:
+      contents: read
+    steps:
+      - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN}" ]; then
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN org secret is missing or empty." >&2
+            echo "This workflow needs it to authenticate to 1Password (vault monadial-cloud)." >&2
+            echo "See WORKFLOWS.md prerequisite 3 — ask an org admin to share the org secret with this repo." >&2
+            exit 1
+          fi
+
+      - name: Load GitHub App credentials from 1Password
+        # App private key is loaded straight from 1Password into this
+        # job's environment and never becomes a GitHub secret (§11.2) —
+        # 1Password is the only durable store for it.
+        uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          CI_WRITEBACK_APP_ID: op://monadial-cloud/github-app-ci-writeback/credentials/app_id
+          CI_WRITEBACK_PRIVATE_KEY: op://monadial-cloud/github-app-ci-writeback/credentials/private_key
+
+      - name: Write-back target short name
+        id: target
+        env:
+          WRITEBACK_REPO: ${{ inputs.writeback_repo }}
+        run: |
+          echo "short_name=${WRITEBACK_REPO##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ env.CI_WRITEBACK_APP_ID }}
+          private-key: ${{ env.CI_WRITEBACK_PRIVATE_KEY }}
+          owner: monadial
+          repositories: ${{ steps.target.outputs.short_name }}
+
+      - name: Checkout write-back target repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: ${{ inputs.writeback_repo }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Pin digest
+        env:
+          WRITEBACK_PATH: ${{ inputs.writeback_path }}
+          WRITEBACK_REGEX: ${{ inputs.writeback_regex }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          match_count="$(grep -c -E "${WRITEBACK_REGEX}" "${WRITEBACK_PATH}")"
+          if [ "${match_count}" -eq 0 ]; then
+            echo "::error::writeback_regex '${WRITEBACK_REGEX}' matched nothing in ${WRITEBACK_PATH}." >&2
+            echo "Refusing to write back a digest pin blindly — fix the regex or the path." >&2
+            exit 1
+          fi
+          sed -E -i "s#${WRITEBACK_REGEX}#${IMAGE}@${DIGEST}#" "${WRITEBACK_PATH}"
+
+      - name: Commit and push
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          WRITEBACK_PATH: ${{ inputs.writeback_path }}
+        run: |
+          if git diff --quiet -- "${WRITEBACK_PATH}"; then
+            echo "No change — ${WRITEBACK_PATH} is already pinned to ${DIGEST}. Nothing to write back."
+            exit 0
+          fi
+          git config user.name "monadial-ci-writeback[bot]"
+          git config user.email "monadial-ci-writeback[bot]@users.noreply.github.com"
+          git add "${WRITEBACK_PATH}"
+          git commit -m "ci: pin ${IMAGE} to ${DIGEST}"
+          git push
