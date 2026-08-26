@@ -18,21 +18,32 @@
 ## the `Publish legacy signature tag` step's own comment for the full
 ## live-diagnosis trail.
 ##
-## v1.0.4 (2026-08-26): the working fix. Kyverno 3.9.0's vendored cosign
-## v3.1.2 (older than this workflow's own cosign) can only discover a
-## signature at the pre-OCI-1.1 `<repo>:sha256-<digest>.sig` tag — a
-## registry like Scaleway's implements neither the native OCI 1.1
-## Referrers API nor that legacy tag by itself, and no cosign CLI flag
-## was found (after live testing, not just reading `--help`/source) that
-## makes `cosign sign` write to it directly on this registry. Instead:
-## `cosign sign` publishes exactly as it always has (the OCI-1.1
-## fallback-tag index), then a new step COPIES the resulting signature
-## manifest to the literal `.sig` tag via a plain registry-API GET+PUT —
-## no re-signing, byte-identical cryptographic content to what the
-## offline-verify step already proved valid. See the `build` job's
-## `Publish legacy signature tag` + `Verify legacy signature tag exists`
-## steps for the full why; the authoritative cluster-side diagnosis lives
-## in monadial-cloud's own gitops/platform/kyverno/policies-images.yaml
+## v1.0.4 (2026-08-26, SUPERSEDED by v1.0.5 same day): got the TAG NAME
+## right (`<repo>:sha256-<digest>.sig` did start existing) via a plain
+## registry-API GET+PUT copy of the signature manifest `cosign sign`
+## already published — but not the CONTENT SHAPE. Live-tested against a
+## real CI run and DISPROVEN by the cluster's own reports-controller:
+## Kyverno's vendored cosign v3.1.2 rejected the copied manifest ("no
+## matching signatures: signature layer ... is missing
+## \"dev.cosignproject.cosign/signature\" annotation") because `cosign
+## sign` publishes the MODERN Sigstore-bundle-format signature, but
+## Kyverno's legacy-tag reader only understands the OLDER "simple
+## signing" annotation layout. See v1.0.5's notes below.
+##
+## v1.0.5 (2026-08-26): the working fix. Same underlying cryptographic
+## material (DSSE payload, raw signature, Fulcio cert, Rekor inclusion
+## proof) as v1.0.4 — no re-signing — but reshaped into the classic
+## annotation layout Kyverno v3.1.2's legacy reader expects
+## (`pkg/oci/internal/signature/layer.go` in that exact cosign version),
+## and published via `cosign attach signature` (cosign's own older,
+## still-functional legacy-format writer) rather than hand-copied JSON.
+## Confirmed via a real registry round-trip test (not just source-
+## reading) that `attach signature` correctly targets the `.sig` tag
+## directly, unlike `cosign sign --registry-referrers-mode=legacy`
+## (v1.0.3, reverted). See the `build` job's `Publish legacy signature
+## tag` + `Verify legacy signature tag exists` steps for the full
+## mechanics; the authoritative cluster-side diagnosis lives in
+## monadial-cloud's own gitops/platform/kyverno/policies-images.yaml
 ## header comment.
 ##
 ## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
@@ -258,52 +269,53 @@ jobs:
         run: |
           # SCW_ACCESS_KEY / SCW_SECRET_KEY: already ambient in this job's
           # environment since the "Load registry push credentials from
-          # 1Password" step (export-env: true) — same credentials
-          # "Docker login" used earlier, reused here directly for the
-          # registry token-auth exchange below (no separate declaration
-          # needed, matching this file's existing convention).
-          # WHY this step exists, and why it's a raw registry-API manifest
-          # COPY rather than a second `cosign sign` call: Kyverno 3.9.0
-          # (this cluster's version) vendors sigstore/cosign v3.1.2, whose
-          # verifyImages code can only discover a signature at the
-          # pre-OCI-1.1 `<repo>:sha256-<digest>.sig` tag (a single OCI
-          # image manifest at that literal tag name) — it has no fallback
-          # to the OCI-1.1-referrers "fallback tag schema" object
-          # (`<repo>:sha256-<digest>`, no `.sig` suffix, an image INDEX)
-          # that `cosign sign` above actually publishes to on THIS
-          # registry (Scaleway implements neither the native Referrers API
-          # nor the legacy .sig tag on its own).
+          # 1Password" step (export-env: true) — reused here directly for
+          # the registry token-auth exchange below.
           #
-          # An EARLIER version of this step tried `cosign sign --yes
-          # --registry-referrers-mode=legacy` on the theory (matching
-          # cosign v3's own cmd/cosign/cli/sign/sign.go source: the flag
-          # gates WriteSignatures() vs WriteSignaturesExperimentalOCI())
-          # that it would force the write to the true legacy `.sig` tag.
-          # **Live-tested against this exact registry via a real CI run
-          # and DISPROVEN**: both the default sign call AND the explicit
-          # `--registry-referrers-mode=legacy` call landed on the exact
-          # same fallback-tag index (confirmed via the registry's raw
-          # `tags/list` API showing no `.sig`-suffixed tag ever created,
-          # and `cosign tree` returning identical results for every
-          # --registry-referrers-mode value) — a real cosign behavior gap
-          # on this registry, not a flag-usage mistake. Reverted; no
-          # cosign CLI flag can produce the `.sig` tag here.
+          # WHY this step exists (history, newest first — read before
+          # touching this):
           #
-          # This step instead COPIES the signature manifest cosign
-          # genuinely already published (one entry inside the fallback-tag
-          # index) to the literal `.sig` tag Kyverno needs, via a plain
-          # registry-side GET + PUT — no re-signing, no new cryptographic
-          # material: the Sigstore bundle (Fulcio cert, Rekor inclusion
-          # proof) is byte-identical to what the offline-verify step above
-          # already proved valid. Standard Docker Registry HTTP API v2
-          # token-auth flow (same technique Task 6's own diagnosis used
-          # against this registry — see
-          # gitops/platform/kyverno/policies-images.yaml, monadial-cloud
-          # repo, header comment for the full history of this gap).
+          # v1.0.5 (this version): v1.0.4's raw manifest COPY approach got
+          # the TAG NAME right (`<repo>:sha256-<digest>.sig` did start
+          # existing, confirmed via curl) but not the CONTENT SHAPE: it
+          # copied cosign's modern Sigstore-bundle-format signature
+          # manifest verbatim, and Kyverno's vendored cosign v3.1.2
+          # rejected it live (`no matching signatures: signature layer ...
+          # is missing "dev.cosignproject.cosign/signature" annotation`,
+          # confirmed via the reports-controller's own logs). Kyverno's
+          # legacy-tag reader (pkg/oci/internal/signature/layer.go in
+          # cosign v3.1.2, the exact version Kyverno 3.9.0 vendors) parses
+          # a completely different, older manifest shape: a layer whose
+          # OCI annotations carry `dev.cosignproject.cosign/signature`
+          # (base64 raw signature), `dev.sigstore.cosign/certificate` (PEM
+          # leaf cert), and `dev.sigstore.cosign/bundle` (a JSON
+          # `RekorBundle` — NOT the modern `dev.sigstore.bundle.v0.3+json`
+          # protobuf format `cosign sign` publishes by default).
+          #
+          # This step converts formats: it fetches the bundle `cosign
+          # sign` (previous step) already published, extracts the exact
+          # same cryptographic material (DSSE payload bytes, raw
+          # signature, Fulcio cert, Rekor inclusion proof — nothing new is
+          # signed), reshapes it into the classic annotation layout, and
+          # publishes via `cosign attach signature` (cosign's own
+          # legacy-format writer — NOT hand-built JSON, to avoid getting
+          # a byte shape subtly wrong). Confirmed via a real registry
+          # round-trip test against this exact registry (not just cosign
+          # source-reading, which had already been wrong once for this
+          # gap — see v1.0.3/v1.0.4 history in the file header) that
+          # `cosign attach signature` correctly targets
+          # `<repo>:sha256-<digest>.sig` directly — unlike plain `cosign
+          # sign --registry-referrers-mode=legacy` (v1.0.3, reverted:
+          # empirically landed on the SAME fallback-tag index as the
+          # default call, no `.sig` tag ever created), `attach signature`
+          # is the OLDER, still-fully-functional command surface this
+          # exact use case was kept working for.
+          #
+          # Full diagnosis history: gitops/platform/kyverno/policies-
+          # images.yaml (monadial-cloud repo) header comment.
           registry="${IMAGE%%/*}"
           repo="${IMAGE#*/}"
           fallback_tag="sha256-${DIGEST#sha256:}"
-          sig_tag="sha256-${DIGEST#sha256:}.sig"
 
           www_auth="$(curl -sI "https://${registry}/v2/" | grep -i '^www-authenticate:' | tr -d '\r')"
           realm="$(echo "${www_auth}" | sed -E 's/.*realm="([^"]+)".*/\1/')"
@@ -319,6 +331,9 @@ jobs:
             exit 1
           fi
 
+          # Find the signature manifest cosign sign (previous step) just
+          # published inside the fallback-tag index, then fetch its layer
+          # blob — the raw Sigstore bundle JSON.
           idx_accept="application/vnd.oci.image.index.v1+json"
           idx_accept="${idx_accept},application/vnd.docker.distribution.manifest.list.v2+json"
           idx_json="$(curl -sf -H "Authorization: Bearer ${token}" \
@@ -329,17 +344,62 @@ jobs:
             echo "::error::No signature manifest inside ${IMAGE}:${fallback_tag} — cosign sign may have failed." >&2
             exit 1
           fi
-
-          manifest_body="$(curl -sf -H "Authorization: Bearer ${token}" \
+          manifest_json="$(curl -sf -H "Authorization: Bearer ${token}" \
             -H "Accept: application/vnd.oci.image.manifest.v1+json" \
             "https://${registry}/v2/${repo}/manifests/${sig_manifest_digest}")"
+          layer_digest="$(echo "${manifest_json}" | jq -r '.layers[0].digest')"
+          if [ -z "${layer_digest}" ] || [ "${layer_digest}" = "null" ]; then
+            echo "::error::Signature manifest ${sig_manifest_digest} has no layer." >&2
+            exit 1
+          fi
+          curl -sfL -H "Authorization: Bearer ${token}" \
+            "https://${registry}/v2/${repo}/blobs/${layer_digest}" -o bundle.json
 
-          echo "Publishing ${IMAGE}:${sig_tag} -> ${sig_manifest_digest}"
-          curl -sf -X PUT \
-            -H "Authorization: Bearer ${token}" \
-            -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
-            -d "${manifest_body}" \
-            "https://${registry}/v2/${repo}/manifests/${sig_tag}"
+          # Reshape: extract the DSSE payload/signature/cert/Rekor-proof
+          # already inside the bundle and write the 4 files `cosign attach
+          # signature` needs. No re-signing — same bytes, same signature,
+          # same cert, same Rekor entry the offline-verify step (previous
+          # job step) already proved valid.
+          python3 - <<'PYEOF'
+          import base64, json
+
+          bundle = json.load(open("bundle.json"))
+          dsse = bundle["dsseEnvelope"]
+          vm = bundle["verificationMaterial"]
+          entry = vm["tlogEntries"][0]
+
+          open("payload.json", "wb").write(base64.b64decode(dsse["payload"]))
+          open("sig.b64", "w").write(dsse["signatures"][0]["sig"])
+
+          cert_der_b64 = vm["certificate"]["rawBytes"]
+          wrapped = "\n".join(
+              cert_der_b64[i : i + 64] for i in range(0, len(cert_der_b64), 64)
+          )
+          with open("cert.pem", "w") as f:
+              f.write(f"-----BEGIN CERTIFICATE-----\n{wrapped}\n-----END CERTIFICATE-----\n")
+
+          key_id_hex = base64.b64decode(entry["logId"]["keyId"]).hex()
+          rekor_response = {
+              "base64Signature": dsse["signatures"][0]["sig"],
+              "rekorBundle": {
+                  "SignedEntryTimestamp": entry["inclusionPromise"]["signedEntryTimestamp"],
+                  "Payload": {
+                      "body": entry["canonicalizedBody"],
+                      "integratedTime": int(entry["integratedTime"]),
+                      "logIndex": int(entry["logIndex"]),
+                      "logID": key_id_hex,
+                  },
+              },
+          }
+          json.dump(rekor_response, open("rekor-response.json", "w"))
+          PYEOF
+
+          cosign attach signature \
+            --payload payload.json \
+            --signature sig.b64 \
+            --certificate cert.pem \
+            --rekor-response rekor-response.json \
+            "${IMAGE}@${DIGEST}"
 
       - name: Verify legacy signature tag exists (Kyverno-vendored-cosign compatibility)
         env:
@@ -347,19 +407,30 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           # Real registry round-trip proving the tag the step above
-          # published is actually fetchable by the exact GET-by-tag access
-          # pattern Kyverno's vendored cosign uses — not a cosign opinion,
-          # a plain `docker manifest inspect` of the computed tag name
-          # (cosign's own legacy AttachedImageTag convention: <algo>-<hex>
-          # .sig), also asserting it's a bare OCI image manifest (not an
-          # index) — the shape Kyverno's older vendored cosign expects at
-          # that exact reference.
+          # published is actually fetchable AND correctly shaped by the
+          # exact access pattern Kyverno's vendored cosign uses — not a
+          # cosign opinion, a plain `docker manifest inspect` of the
+          # computed tag name (cosign's own legacy AttachedImageTag
+          # convention: <algo>-<hex>.sig): asserts it's a bare OCI image
+          # manifest (not an index) carrying the classic
+          # `dev.cosignproject.cosign/signature` layer annotation —
+          # exactly what previously broke (v1.0.4), so this check is what
+          # would have caught that regression before it ever reached the
+          # cluster.
           sig_tag="sha256-${DIGEST#sha256:}.sig"
           echo "Checking for legacy signature tag: ${IMAGE}:${sig_tag}"
-          media_type="$(docker manifest inspect "${IMAGE}:${sig_tag}" | jq -r '.mediaType')"
+          manifest="$(docker manifest inspect "${IMAGE}:${sig_tag}")"
+          media_type="$(echo "${manifest}" | jq -r '.mediaType')"
+          sig_annotation_jq='.layers[0].annotations."dev.cosignproject.cosign/signature" // empty'
+          sig_annotation="$(echo "${manifest}" | jq -r "${sig_annotation_jq}")"
           echo "mediaType: ${media_type}"
           if [ "${media_type}" != "application/vnd.oci.image.manifest.v1+json" ]; then
             echo "::error::${IMAGE}:${sig_tag} is not a bare OCI image manifest (got mediaType=${media_type})." >&2
+            exit 1
+          fi
+          if [ -z "${sig_annotation}" ]; then
+            echo "::error::${IMAGE}:${sig_tag} layer is missing the" >&2
+            echo "::error::signature annotation Kyverno's legacy reader requires." >&2
             exit 1
           fi
 
