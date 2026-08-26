@@ -274,6 +274,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: ${{ inputs.writeback_repo }}
+          # ref: explicit — when writeback_repo == the calling repo,
+          # checkout's default ref is the RUN's triggering SHA, so a push
+          # from that base is rejected the moment ANY commit lands on main
+          # after the run started (live-hit on the first verifier run,
+          # 2026-08-26). Always write back on top of current main.
+          ref: main
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Pin digest
@@ -305,4 +311,13 @@ jobs:
           git config user.email "monadial-ci-writeback[bot]@users.noreply.github.com"
           git add "${WRITEBACK_PATH}"
           git commit -m "ci: pin ${IMAGE} to ${DIGEST}"
+          # Rebase-retry: main can advance between checkout and push (other
+          # write-backs, human commits). The pin edit is a single line with
+          # a stable anchor, so a rebase is conflict-free unless the SAME
+          # line changed — in which case failing is correct.
+          for attempt in 1 2 3; do
+            if git push; then exit 0; fi
+            echo "push rejected (attempt ${attempt}) — rebasing onto latest main"
+            git pull --rebase origin main
+          done
           git push
