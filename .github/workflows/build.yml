@@ -158,18 +158,17 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
 
-      - name: Push image
-        # Same buildx builder instance as the step above (created once by
-        # setup-buildx-action for the whole job) — BuildKit reuses its
-        # local build cache from the scan build, so this is normally a
-        # near-instant re-export/push rather than a full rebuild.
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
-        with:
-          context: ${{ inputs.context }}
-          file: ${{ inputs.dockerfile }}
-          platforms: ${{ inputs.platforms }}
-          push: true
-          tags: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
+      - name: Push image (the exact scanned bytes)
+        # Review fix (T3, 2026-08-26): a second build-push-action call here
+        # was a REBUILD whose identity with the scanned image rested on an
+        # unproven cache hit — the classic scan-then-swap window. A plain
+        # `docker push` of the tag ALREADY LOADED into the daemon pushes the
+        # byte-identical image Trivy just scanned, by construction.
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          docker push "${IMAGE}:${TAG}"
 
       - name: Resolve pushed digest
         id: digest
@@ -202,6 +201,19 @@ jobs:
           # default, so `cosign verify --offline --bundle` works later
           # without a live Rekor round-trip (§1).
           cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify signature offline (Rekor bundle attached — §1 requirement)
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          # Proves the just-created signature verifies WITHOUT network access
+          # to Rekor (bundle embedded) — the offline-capability the cluster's
+          # verifyImages admission relies on during a Sigstore outage.
+          cosign verify --offline \
+            --certificate-identity-regexp '^https://github.com/monadial/\.github/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE}@${DIGEST}"
 
   writeback:
     name: write back pinned digest
