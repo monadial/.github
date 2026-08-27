@@ -13,7 +13,8 @@ and reusable workflows**.
 ```yaml
 jobs:
   build:
-    uses: monadial/.github/.github/workflows/build.yml@v1
+    # Pin the exact patch tag, NOT @v1 — see "Tag policy" below.
+    uses: monadial/.github/.github/workflows/build.yml@v1.0.7
     with:
       image: rg.nl-ams.scw.cloud/monadial/hello
       context: .
@@ -30,12 +31,12 @@ jobs:
 
 | Input | Required | Description |
 | --- | --- | --- |
-| `image` | yes | Fully-qualified image repository, no tag/digest — e.g. `rg.nl-ams.scw.cloud/monadial/hello`. |
+| `image` | yes | Fully-qualified image repository, no tag/digest — e.g. `rg.nl-ams.scw.cloud/monadial/hello`. **Must not contain `#`**, for the same reason as `writeback_regex` below (v1.0.7). |
 | `context` | yes | Docker build context, relative to the calling repo root. |
 | `dockerfile` | yes | Path to the Dockerfile, relative to the calling repo root. |
 | `writeback_repo` | yes | `owner/repo` of the deploy-manifest repository to pin the digest into — e.g. `monadial/hello`. |
 | `writeback_path` | yes | Path (within `writeback_repo`) to the file whose image reference gets updated. |
-| `writeback_regex` | yes | Extended-regex (`grep -E`/`sed -E` compatible) matching the exact `image@sha256:...` reference to replace. **The write-back job fails on purpose if this matches zero lines** — a silently-no-op write-back is treated as a bug, not a success. |
+| `writeback_regex` | yes | Extended-regex (`grep -E`/`sed -E` compatible) matching the exact `image@sha256:...` reference to replace. **The write-back job fails on purpose if this matches zero lines** — a silently-no-op write-back is treated as a bug, not a success. **Must not contain `#`** (v1.0.7): it is the delimiter of the `sed` s-expression this value is interpolated into, so a `#` could terminate that expression and inject sed flags/commands — GNU sed's `s///e` executes shell, in the job holding the write-back App token. The check is a raw-substring test, so `[#]` is refused too. |
 | `platforms` | no (default `linux/amd64`) | Comma-separated buildx platform list. Single-platform only — the pipeline builds locally (`load: true`) to scan before push, and `load` does not support multi-platform manifests. |
 | `tag` | no (default: the caller's commit SHA) | Tag used for the build/scan/pre-push steps. The image that ends up signed and written back is always referenced **by digest**, never by this tag. |
 
@@ -102,19 +103,26 @@ list all of them under `paths-ignore`.
 Callers pin to a **major-version tag family**, not a full SHA:
 
 ```yaml
-uses: monadial/.github/.github/workflows/build.yml@v1
+uses: monadial/.github/.github/workflows/build.yml@v1.0.7
 ```
 
-`v1` moves forward to the latest compatible `v1.x.y` release; a breaking
-change to this workflow's contract ships as `v2`. The underlying tags
-(`v1.0.0`, `v1`, …) are intended to be admin-only / immutable once the
-target repository ruleset for `monadial/.github` is in place (protecting
-`v*` tags — see Prerequisite 5; **as of this writing that ruleset has not
-been created yet**, so `v1`/`v1.0.0` are technically movable by anyone with
-push access until an org admin creates it. Kyverno's `verifyImages`
-attestor trusts the tag family via `subjectRegExp`, which is exactly why
-the ruleset matters — treat creating it as a blocking follow-up, not
-optional hardening).
+`v1` is intended to move forward to the latest compatible `v1.x.y`
+release; a breaking change to this workflow's contract ships as `v2`.
+
+**Status of the `v*` tag ruleset: LIVE.** The `protect-v-tags` repository
+ruleset on `monadial/.github` is `enforcement: active`, `target: tag`,
+covering `refs/tags/v*` with `creation`/`update`/`deletion`/
+`non_fast_forward` rules and an `OrganizationAdmin` bypass (verified via
+`gh api repos/monadial/.github/rulesets`). So `v1` and every `v1.0.x` are
+immovable by CI, and creating a new version tag is an org-admin act. This
+matters because Kyverno's `verifyImages` attestor in `monadial-cloud`
+trusts this workflow by its tag family via `subjectRegExp` — a movable tag
+would make that trust meaningless.
+
+**`v1` currently points at `d627f2d` (the pre-fix v1.0.0 commit) and has
+NOT been moved.** Callers therefore pin the exact patch tag, not `v1`:
+`...build.yml@v1.0.7`. Moving `v1` forward is an outstanding owner release
+act; until it happens, `@v1` is not just stale but wrong.
 
 ## `rescan.yml` — weekly re-scan of deployed digests
 

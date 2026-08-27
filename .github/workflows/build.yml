@@ -61,6 +61,24 @@
 ## monadial-cloud's own gitops/platform/kyverno/policies-images.yaml
 ## header comment.
 ##
+## v1.0.7 (2026-08-27): SECURITY — input validation on the write-back
+## substitution. The `Pin digest` step ran
+## `sed -E -i "s#${WRITEBACK_REGEX}#${IMAGE}@${DIGEST}#"` with a
+## caller-supplied `writeback_regex`. `#` is the s-expression delimiter
+## there, so a `#` anywhere in that input closes the expression early and
+## everything after it is read by sed as REPLACEMENT + FLAGS + further
+## commands. GNU sed (what ubuntu-latest ships) has an `e` flag on `s///`
+## that executes the result as a shell command — inside the one job that
+## holds a live `monadial-ci-writeback` App installation token. Same
+## reasoning applies to `image`, which is also a caller input and also
+## interpolated into the same expression. Callers are trusted today (this
+## is a private-org reusable workflow, and every caller is in this org),
+## which is why this is a shape fix rather than an incident — but "the
+## input happens to be trustworthy" is not a control, and this one is
+## cheap: reject `#` in either input, and require `digest` to be a literal
+## `sha256:<64 hex>`. Found by the Phase 5 whole-branch final review
+## (finding 9). No behavioural change for any well-formed caller.
+##
 ## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
 ## with the human-readable release tag it currently resolves to as a
 ## trailing comment. Re-resolve with:
@@ -107,6 +125,11 @@ name: build
           Extended-regex (grep -E / sed -E compatible) matching the exact
           image reference line/value in writeback_path to replace. Must
           match at least one line or the write-back job fails on purpose.
+          MUST NOT CONTAIN '#' — it is the delimiter of the `sed`
+          s-expression this value is interpolated into, and the write-back
+          job rejects it outright (v1.0.7). The same applies to `image`.
+          The check is a raw-substring test, so a bracket expression like
+          [#] is refused too; a container image reference never needs one.
         required: true
         type: string
       platforms:
@@ -478,6 +501,46 @@ jobs:
           IMAGE: ${{ inputs.image }}
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
+          # v1.0.7 SECURITY GATE — validate BEFORE the substitution.
+          #
+          # WRITEBACK_REGEX and IMAGE are both caller-supplied, and both are
+          # interpolated into a `sed` s-expression whose delimiter is '#'.
+          # A '#' anywhere in either value terminates that expression early;
+          # everything after it is then read by sed as replacement text,
+          # FLAGS and further commands. GNU sed (what ubuntu-latest ships)
+          # honours an `e` flag on `s///` that executes the result as a
+          # shell command — in the one job holding a live write-back App
+          # installation token.
+          #
+          # Reject rather than escape. The check is a plain substring test
+          # on the RAW character, so even a character class like [#] is
+          # refused: a substring test is auditable at a glance, whereas
+          # "is this '#' inside a bracket expression?" means parsing ERE,
+          # and no caller has ever needed to match a literal hash inside a
+          # container image reference. A refused build is strictly better
+          # than a build that silently runs caller-chosen shell.
+          case "${WRITEBACK_REGEX}" in
+            *'#'*)
+              echo "::error::writeback_regex contains '#', the sed s-expression delimiter this step uses." >&2
+              echo "Refusing to substitute — a '#' here terminates the expression and can inject sed flags/commands (GNU sed's s///e executes shell)." >&2
+              exit 1
+              ;;
+          esac
+          case "${IMAGE}" in
+            *'#'*)
+              echo "::error::image contains '#', the sed s-expression delimiter this step uses." >&2
+              echo "Refusing to substitute — see the writeback_regex error above for why." >&2
+              exit 1
+              ;;
+          esac
+          # DIGEST is produced by `docker inspect` in the build job rather
+          # than by a caller, but it crosses a job boundary as an output, so
+          # it is pinned to its exact expected literal shape as well.
+          if ! printf '%s' "${DIGEST}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::digest '${DIGEST}' is not a literal sha256:<64 hex> reference." >&2
+            exit 1
+          fi
+
           match_count="$(grep -c -E "${WRITEBACK_REGEX}" "${WRITEBACK_PATH}")"
           if [ "${match_count}" -eq 0 ]; then
             echo "::error::writeback_regex '${WRITEBACK_REGEX}' matched nothing in ${WRITEBACK_PATH}." >&2
