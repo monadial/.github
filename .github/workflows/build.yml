@@ -79,6 +79,17 @@
 ## `sha256:<64 hex>`. Found by the Phase 5 whole-branch final review
 ## (finding 9). No behavioural change for any well-formed caller.
 ##
+## v1.0.8 (2026-09-01): the Trivy gate now passes `ignore-unfixed: true`,
+## making the step match what every doc already said it does ("gates on
+## fixable HIGH/CRITICAL"). The gap never fired before because hello
+## (distroless) and infra-docs (alpine) carry zero UNFIXED HIGH/CRITICAL
+## findings; aktum's node:22-slim images are the first debian-slim through
+## this pipeline, and debian 12 ships several HIGH/CRITICAL CVEs with no
+## fix available (zlib CVE-2023-45853 will_not_fix, perl fix_deferred,
+## bsdutils affected) that no apt-get upgrade can remove. Blocking on those
+## gates nothing actionable; they still appear in the scan output. Fixable
+## findings block exactly as before.
+##
 ## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
 ## with the human-readable release tag it currently resolves to as a
 ## trailing comment. Re-resolve with:
@@ -233,6 +244,9 @@ jobs:
           image-ref: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
           severity: HIGH,CRITICAL
           exit-code: "1"
+          # v1.0.8: gate on FIXABLE findings only - see the version history
+          # comment at the top of this file.
+          ignore-unfixed: true
 
       - name: Push image (the exact scanned bytes)
         # Review fix (T3, 2026-08-26): a second build-push-action call here
