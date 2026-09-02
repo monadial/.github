@@ -90,6 +90,13 @@
 ## gates nothing actionable; they still appear in the scan output. Fixable
 ## findings block exactly as before.
 ##
+## v1.0.9 (2026-09-02): cross-org write-back. The token-mint step
+## hardcoded `owner: monadial`, so a writeback_repo in another org asked
+## for an installation of monadial/<short-name> and 404ed (first hit:
+## aktumhq/aktum). The owner is now derived from writeback_repo itself;
+## the App must simply be installed on the target org with access to the
+## target repo. No change for same-org callers.
+##
 ## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
 ## with the human-readable release tag it currently resolves to as a
 ## trailing comment. Re-resolve with:
@@ -480,11 +487,12 @@ jobs:
           CI_WRITEBACK_APP_ID: op://monadial-cloud/github-app-ci-writeback/credentials/app_id
           CI_WRITEBACK_PRIVATE_KEY: op://monadial-cloud/github-app-ci-writeback/credentials/private_key
 
-      - name: Write-back target short name
+      - name: Write-back target owner and short name
         id: target
         env:
           WRITEBACK_REPO: ${{ inputs.writeback_repo }}
         run: |
+          echo "owner=${WRITEBACK_REPO%%/*}" >> "$GITHUB_OUTPUT"
           echo "short_name=${WRITEBACK_REPO##*/}" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub App installation token
@@ -493,7 +501,11 @@ jobs:
         with:
           app-id: ${{ env.CI_WRITEBACK_APP_ID }}
           private-key: ${{ env.CI_WRITEBACK_PRIVATE_KEY }}
-          owner: monadial
+          # v1.0.9: derive the owner from writeback_repo instead of the
+          # hardcoded `monadial` - the App is installed per target org, and
+          # a cross-org caller (first: aktumhq/aktum) 404s on the token
+          # mint otherwise. Same-org callers resolve identically.
+          owner: ${{ steps.target.outputs.owner }}
           repositories: ${{ steps.target.outputs.short_name }}
 
       - name: Checkout write-back target repository
