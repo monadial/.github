@@ -39,6 +39,7 @@ jobs:
 | `writeback_regex` | yes | Extended-regex (`grep -E`/`sed -E` compatible) matching the exact `image@sha256:...` reference to replace. **The write-back job fails on purpose if this matches zero lines** — a silently-no-op write-back is treated as a bug, not a success. **Must not contain `#`** (v1.0.7): it is the delimiter of the `sed` s-expression this value is interpolated into, so a `#` could terminate that expression and inject sed flags/commands — GNU sed's `s///e` executes shell, in the job holding the write-back App token. The check is a raw-substring test, so `[#]` is refused too. |
 | `platforms` | no (default `linux/amd64`) | Comma-separated buildx platform list. Single-platform only — the pipeline builds locally (`load: true`) to scan before push, and `load` does not support multi-platform manifests. |
 | `tag` | no (default: the caller's commit SHA) | Tag used for the build/scan/pre-push steps. The image that ends up signed and written back is always referenced **by digest**, never by this tag. |
+| `build_args` | no (default empty) | Newline-separated `KEY=VALUE` list passed to the image build as `--build-arg` (v1.0.10) — e.g. provenance stamps `GIT_SHA=${{ github.sha }}`. Build args persist in image history: **never pass secrets here.** |
 
 ### Required secret
 

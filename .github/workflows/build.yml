@@ -97,6 +97,14 @@
 ## the App must simply be installed on the target org with access to the
 ## target repo. No change for same-org callers.
 ##
+## v1.0.10 (2026-09-03): optional `build_args` input, passed through to
+## the (single) image build verbatim. Motivation: build provenance —
+## frontend bundles bake GIT_SHA/BUILD_TIME/APP_VERSION at image build,
+## and with no way to pass them every CI image shipped the Dockerfile
+## defaults ("vdev · local" in the app chrome). Values land in image
+## layers and history: never pass secrets through it. No change for
+## callers that omit it.
+##
 ## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
 ## with the human-readable release tag it currently resolves to as a
 ## trailing comment. Re-resolve with:
@@ -159,6 +167,15 @@ name: build
         description: >-
           Tag to build/scan/push under before signing by digest. Defaults
           to the calling workflow run's commit SHA when not supplied.
+        required: false
+        type: string
+        default: ""
+      build_args:
+        description: >-
+          Newline-separated KEY=VALUE list passed to the image build as
+          --build-arg (e.g. provenance stamps GIT_SHA / BUILD_TIME /
+          APP_VERSION). Build args persist in image history — never pass
+          secrets here.
         required: false
         type: string
         default: ""
@@ -244,6 +261,7 @@ jobs:
           push: false
           load: true
           tags: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
+          build-args: ${{ inputs.build_args }}
 
       - name: Scan with Trivy (gate — must pass before anything is pushed)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
