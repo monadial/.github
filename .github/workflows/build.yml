@@ -129,10 +129,15 @@
 ## writes its layers in the calling repo's GitHub Actions cache
 ## (docker/build-push-action's cache-from/cache-to, type=gha, mode=max),
 ## scoped to the image name's last path segment plus the arch
-## (aktum-backend-arm64), so no two images or legs share one. ignore-error
-## keeps a failed cache export (the cache service throttling) from failing
-## the build. The leg still loads, Trivy-scans and pushes exactly as before:
-## a layer served from the cache is scanned like one just built. A caller
+## (aktum-backend-arm64), so no two legs, and no two images with distinct
+## names, share one. ignore-error keeps a failed cache export (the cache
+## service throttling) from failing the build. The leg still loads,
+## Trivy-scans and pushes exactly as before: a layer served from the cache
+## is scanned like one just built. Layers of the image that `publish` signs
+## can come from the caller's default-branch Actions cache, which any
+## workflow running on that branch can write; BuildKit trusts an imported
+## cache and Trivy catches only known CVEs, so `cache` belongs only in repos
+## where every workflow that runs on the default branch is trusted. A caller
 ## that leaves `cache` out builds exactly as under v1.1.0. A cached
 ## OS-upgrade layer stays cached until its base image digest moves, so a
 ## caller that patches the OS passes a build argument that changes weekly
@@ -353,9 +358,10 @@ jobs:
           fi
           # v1.1.1, opt-in: one layer cache per image and architecture, named
           # for the image's last path segment (.../monadial/aktum-backend on
-          # arm64 is aktum-backend-arm64), so two images or two legs never
-          # read each other's layers. Without `cache: true` both outputs stay
-          # empty, and the build step reads and writes no cache.
+          # arm64 is aktum-backend-arm64), so two legs, or two images with
+          # distinct names, never read each other's layers. Without
+          # `cache: true` both outputs stay empty, and the build step reads
+          # and writes no cache.
           if [ "${CACHE}" = "true" ]; then
             scope="${IMAGE##*/}-${ARCH}"
             echo "cache_from=type=gha,scope=${scope}" >> "$GITHUB_OUTPUT"
