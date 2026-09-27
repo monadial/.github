@@ -83,6 +83,8 @@ so it stays at the conservative non-empty default, `read`.
 
 With `cache: true`, each build leg reads and writes BuildKit layers in the **calling** repository's GitHub Actions cache (`type=gha`, `mode=max`), one scope per image and architecture: the image name's last path segment plus the arch, for example `aktum-backend-arm64`. A cache export that fails never fails the build (`ignore-error=true`). A cached layer is loaded, scanned and pushed like a built one, so the Trivy gate is unchanged. Without `cache`, nothing is read or written.
 
+Layers of the image that `publish` signs can come from the caller's default-branch Actions cache, which any workflow running on that branch can write; BuildKit trusts an imported cache and Trivy catches only known CVEs, so enable `cache` only in repos where every workflow that runs on the default branch is trusted.
+
 Layers that patch the OS (`apt-get upgrade`, `apk upgrade`) are cached too, until the base image's digest changes. A caller that patches the OS declares a build argument that changes weekly directly before that layer and passes it through `build_args`. Aktum declares `ARG SECURITY_REFRESH` and passes `SECURITY_REFRESH=$(date -u +%G-W%V)`. A new value misses the cache there, so the upgrade reruns at least once a week.
 
 When Trivy blocks a build within the week on a fix the upgrade would now install, clear the cache and build again:
