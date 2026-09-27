@@ -46,7 +46,7 @@ jobs:
 
 | Secret | Required | Description |
 | --- | --- | --- |
-| `OP_SERVICE_ACCOUNT_TOKEN` | yes | Org secret — a 1Password service-account token (read-only, vault `monadial-cloud`). Both jobs authenticate to 1Password with it; **every job fails fast with an explicit `::error::`** if it is missing or empty, rather than a cryptic 1Password-CLI auth failure. |
+| `OP_SERVICE_ACCOUNT_TOKEN` | yes | Org secret — a 1Password service-account token (read-only, vault `monadial-cloud`). The build legs, `publish` and `writeback` authenticate to 1Password with it; **every job fails fast with an explicit `::error::`** if it is missing or empty, rather than a cryptic 1Password-CLI auth failure. |
 
 App credentials for the write-back job (`github-app-ci-writeback` — App ID,
 private key) are **not** GitHub secrets at all: they are read from
