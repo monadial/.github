@@ -41,6 +41,7 @@ jobs:
 | `tag` | no (default: the caller's commit SHA) | Tag used for the build/scan/pre-push steps. The image that ends up signed and written back is always referenced **by digest**, never by this tag. |
 | `build_args` | no (default empty) | Newline-separated `KEY=VALUE` list passed to the image build as `--build-arg` (v1.0.10) — e.g. provenance stamps `GIT_SHA=${{ github.sha }}`. Build args persist in image history: **never pass secrets here.** |
 | `writeback` | no (default `true`) | `false` skips the write-back job (dry run). |
+| `cache` | no (default `false`) | `true` gives each build leg a BuildKit layer cache in the calling repo's Actions cache, scope `<image name>-<arch>` (v1.1.1). See "Layer cache" below. |
 
 ### Required secret
 
@@ -63,7 +64,7 @@ never touches GitHub's secret store.
 ### Pipeline shape
 
 1. **`plan` job** (`permissions: {}`): maps each `platforms` entry to a native runner (`linux/amd64` → `ubuntu-latest`, `linux/arm64` → `ubuntu-24.04-arm`) and emits the build matrix; an unsupported, repeated or empty platform list fails here. Nothing is ever emulated.
-2. **`build` job** (a matrix, one leg per platform; `permissions: {contents: read}`, no `id-token`): each leg, on its own architecture: checkout → verify `OP_SERVICE_ACCOUNT_TOKEN` present → load Scaleway registry push credentials from 1Password (`op://monadial-cloud/scw-registry-push-ci/credentials/*`) → `docker login` → `docker buildx build` locally (`push: false, load: true`) → **Trivy scan gate** (`--severity HIGH,CRITICAL --exit-code 1`, fixable findings only; the leg stops here, nothing is ever pushed unscanned) → `docker push` of the loaded tag (the exact scanned bytes) → resolve the pushed digest (`docker pull` + `docker inspect` RepoDigests, not the tag) into a per-arch output (`digest_amd64`, `digest_arm64`). A multi-arch leg pushes `<tag>-<arch>`; a single-platform leg pushes `<tag>` itself.
+2. **`build` job** (a matrix, one leg per platform; `permissions: {contents: read}`, no `id-token`): each leg, on its own architecture: checkout → verify `OP_SERVICE_ACCOUNT_TOKEN` present → load Scaleway registry push credentials from 1Password (`op://monadial-cloud/scw-registry-push-ci/credentials/*`) → `docker login` → `docker buildx build` locally (`push: false, load: true`; with `cache: true`, layers read from and written to the calling repo's Actions cache, scope `<image name>-<arch>`, v1.1.1) → **Trivy scan gate** (`--severity HIGH,CRITICAL --exit-code 1`, fixable findings only; the leg stops here, nothing is ever pushed unscanned) → `docker push` of the loaded tag (the exact scanned bytes) → resolve the pushed digest (`docker pull` + `docker inspect` RepoDigests, not the tag) into a per-arch output (`digest_amd64`, `digest_arm64`). A multi-arch leg pushes `<tag>-<arch>`; a single-platform leg pushes `<tag>` itself.
 3. **`publish` job** (`permissions: {id-token: write}`, the only job that signs): verify `OP_SERVICE_ACCOUNT_TOKEN` present → load registry credentials → `docker login` → with one platform, take that leg's digest; with two, `docker buildx imagetools create` the index `<tag>` from the legs' digests and **refuse it unless it holds exactly the scanned leg digests** (an extra manifest, such as an attestation, would otherwise be signed unscanned) → install cosign → **`cosign sign --yes <image>@<digest>`** for every digest (the index and each leg), keyless (identity = this job's OIDC token), Rekor bundle included by default so admission verification is offline-capable → offline verify → the same sign and verify again with cosign v2.5.3 (legacy format, Kyverno-vendored-cosign compatibility) → check each legacy `.sig` tag's shape.
 4. **`writeback` job** (`needs: publish`; skipped when `writeback` is false; `permissions: {contents: read}`; see note below): verify `OP_SERVICE_ACCOUNT_TOKEN` present → load the GitHub App credentials from 1Password → mint a short-lived App installation token scoped to `writeback_repo` only (`actions/create-github-app-token`) → checkout `writeback_repo` with that token → `sed -E -i` the digest line matched by `writeback_regex` (refusing to proceed if the regex matched nothing) → commit `ci: pin <image> to <digest>` (skipped as a no-op if the digest didn't actually change) → push.
 
@@ -77,6 +78,17 @@ installation scopes to `writeback_repo` alone. Granting `contents: write`
 on the ambient token here would only widen the blast radius of a bug in
 this job (accidental write access to the calling repo) for zero benefit —
 so it stays at the conservative non-empty default, `read`.
+
+### Layer cache (v1.1.1, opt-in)
+
+With `cache: true`, each build leg reads and writes BuildKit layers in the **calling** repository's GitHub Actions cache (`type=gha`, `mode=max`), one scope per image and architecture: the image name's last path segment plus the arch, for example `aktum-backend-arm64`. A cache export that fails never fails the build (`ignore-error=true`). A cached layer is loaded, scanned and pushed like a built one, so the Trivy gate is unchanged. Without `cache`, nothing is read or written.
+
+Layers that patch the OS (`apt-get upgrade`, `apk upgrade`) are cached too, until the base image's digest changes. A caller that patches the OS declares a build argument that changes weekly directly before that layer and passes it through `build_args`. Aktum declares `ARG SECURITY_REFRESH` and passes `SECURITY_REFRESH=$(date -u +%G-W%V)`. A new value misses the cache there, so the upgrade reruns at least once a week.
+
+When Trivy blocks a build within the week on a fix the upgrade would now install, clear the cache and build again:
+
+    gh cache list --repo <owner>/<repo>
+    gh cache delete --all --repo <owner>/<repo>
 
 ### ⚠️ Loop-guard requirement (every caller MUST set this)
 
@@ -180,6 +192,7 @@ actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1,
 | `actions/create-github-app-token` | v3.2.0 | `bcd2ba49218906704ab6c1aa796996da409d3eb1` |
 
 v1.1.0 adds no action: multi-arch reuses the pins above, and digests cross jobs as outputs, not artifacts.
+v1.1.1 adds no action either: the layer cache is an input of docker/build-push-action.
 
 **Transitive-action note:** `aquasecurity/trivy-action` internally calls a
 SHA-pinned `aquasecurity/setup-trivy` step, and that step uses
