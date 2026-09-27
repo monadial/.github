@@ -124,6 +124,20 @@
 ## legs never overwrite each other, and no artifact action (not on the org
 ## allowlist) is needed.
 ##
+## v1.1.1 (2026-09-27): opt-in BuildKit layer cache. A new boolean input
+## `cache` (default false). With `cache: true`, each build leg reads and
+## writes its layers in the calling repo's GitHub Actions cache
+## (docker/build-push-action's cache-from/cache-to, type=gha, mode=max),
+## scoped to the image name's last path segment plus the arch
+## (aktum-backend-arm64), so no two images or legs share one. ignore-error
+## keeps a failed cache export (the cache service throttling) from failing
+## the build. The leg still loads, Trivy-scans and pushes exactly as before:
+## a layer served from the cache is scanned like one just built. A caller
+## that leaves `cache` out builds exactly as under v1.1.0. A cached
+## OS-upgrade layer stays cached until its base image digest moves, so a
+## caller that patches the OS passes a build argument that changes weekly
+## right before that layer (WORKFLOWS.md). No new action.
+##
 ## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
 ## with the human-readable release tag it currently resolves to as a
 ## trailing comment. Re-resolve with:
@@ -208,6 +222,14 @@ name: build
         required: false
         type: boolean
         default: true
+      cache:
+        description: >-
+          Read and write a BuildKit layer cache in the calling repo's GitHub
+          Actions cache, one scope per image and architecture (v1.1.1).
+          false (the default) builds exactly as v1.1.0 did.
+        required: false
+        type: boolean
+        default: false
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         description: >-
@@ -312,12 +334,14 @@ jobs:
           SCW_ACCESS_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/access_key
           SCW_SECRET_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/secret_key
 
-      - name: Determine build tag
+      - name: Determine build tag and layer cache
         id: vars
         env:
           INPUT_TAG: ${{ inputs.tag }}
           MULTI: ${{ needs.plan.outputs.multi }}
           ARCH: ${{ matrix.arch }}
+          IMAGE: ${{ inputs.image }}
+          CACHE: ${{ inputs.cache }}
         run: |
           if [ -n "${INPUT_TAG}" ]; then base="${INPUT_TAG}"; else base="${GITHUB_SHA}"; fi
           # A multi-arch leg pushes <tag>-<arch>; publish owns <tag> (the
@@ -326,6 +350,16 @@ jobs:
             echo "tag=${base}-${ARCH}" >> "$GITHUB_OUTPUT"
           else
             echo "tag=${base}" >> "$GITHUB_OUTPUT"
+          fi
+          # v1.1.1, opt-in: one layer cache per image and architecture, named
+          # for the image's last path segment (.../monadial/aktum-backend on
+          # arm64 is aktum-backend-arm64), so two images or two legs never
+          # read each other's layers. Without `cache: true` both outputs stay
+          # empty, and the build step reads and writes no cache.
+          if [ "${CACHE}" = "true" ]; then
+            scope="${IMAGE##*/}-${ARCH}"
+            echo "cache_from=type=gha,scope=${scope}" >> "$GITHUB_OUTPUT"
+            echo "cache_to=type=gha,mode=max,scope=${scope},ignore-error=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Docker login (Scaleway registry)
@@ -348,6 +382,11 @@ jobs:
           load: true
           tags: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
           build-args: ${{ inputs.build_args }}
+          # v1.1.1: empty unless the caller set `cache: true`; an empty
+          # cache-from or cache-to reads or writes nothing. The image is
+          # still loaded, scanned and pushed as above.
+          cache-from: ${{ steps.vars.outputs.cache_from }}
+          cache-to: ${{ steps.vars.outputs.cache_to }}
 
       - name: Scan with Trivy (gate — must pass before anything is pushed)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
