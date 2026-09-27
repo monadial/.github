@@ -37,9 +37,10 @@ jobs:
 | `writeback_repo` | yes | `owner/repo` of the deploy-manifest repository to pin the digest into — e.g. `monadial/hello`. |
 | `writeback_path` | yes | Path (within `writeback_repo`) to the file whose image reference gets updated. |
 | `writeback_regex` | yes | Extended-regex (`grep -E`/`sed -E` compatible) matching the exact `image@sha256:...` reference to replace. **The write-back job fails on purpose if this matches zero lines** — a silently-no-op write-back is treated as a bug, not a success. **Must not contain `#`** (v1.0.7): it is the delimiter of the `sed` s-expression this value is interpolated into, so a `#` could terminate that expression and inject sed flags/commands — GNU sed's `s///e` executes shell, in the job holding the write-back App token. The check is a raw-substring test, so `[#]` is refused too. |
-| `platforms` | no (default `linux/amd64`) | Comma-separated buildx platform list. Single-platform only — the pipeline builds locally (`load: true`) to scan before push, and `load` does not support multi-platform manifests. |
+| `platforms` | no (default `linux/amd64`) | `linux/amd64`, `linux/arm64`, or both. Each builds on its own native runner (`ubuntu-latest`, `ubuntu-24.04-arm`); two produce an index signed alongside its per-arch images (v1.1.0). |
 | `tag` | no (default: the caller's commit SHA) | Tag used for the build/scan/pre-push steps. The image that ends up signed and written back is always referenced **by digest**, never by this tag. |
 | `build_args` | no (default empty) | Newline-separated `KEY=VALUE` list passed to the image build as `--build-arg` (v1.0.10) — e.g. provenance stamps `GIT_SHA=${{ github.sha }}`. Build args persist in image history: **never pass secrets here.** |
+| `writeback` | no (default `true`) | `false` skips the write-back job (dry run). |
 
 ### Required secret
 
@@ -57,12 +58,14 @@ never touches GitHub's secret store.
 
 | Output | Description |
 | --- | --- |
-| `digest` | `sha256:...` digest of the pushed, signed image. |
+| `digest` | `sha256:...` digest: the index digest when more than one platform is built, else the image digest; signed either way. |
 
 ### Pipeline shape
 
-1. **`build` job** (`permissions: {id-token: write, contents: read}`): checkout → verify `OP_SERVICE_ACCOUNT_TOKEN` present → load Scaleway registry push credentials from 1Password (`op://monadial-cloud/scw-registry-push-ci/credentials/*`) → `docker login` → `docker buildx build` locally (`push: false, load: true`) → **Trivy scan gate** (`--severity HIGH,CRITICAL --exit-code 1` — build stops here on any HIGH/CRITICAL finding, nothing is ever pushed unscanned) → push (`push: true`, same buildx builder so BuildKit's cache is reused) → resolve the pushed digest (`docker pull` + `docker inspect` RepoDigests, not the tag) → install cosign → **`cosign sign --yes <image>@<digest>`**, keyless (identity = this job's OIDC token), Rekor bundle included by default so admission verification is offline-capable.
-2. **`writeback` job** (`needs: build`, `permissions: {contents: read}` — see note below): verify `OP_SERVICE_ACCOUNT_TOKEN` present → load the GitHub App credentials from 1Password → mint a short-lived App installation token scoped to `writeback_repo` only (`actions/create-github-app-token`) → checkout `writeback_repo` with that token → `sed -E -i` the digest line matched by `writeback_regex` (refusing to proceed if the regex matched nothing) → commit `ci: pin <image> to <digest>` (skipped as a no-op if the digest didn't actually change) → push.
+1. **`plan` job** (`permissions: {}`): maps each `platforms` entry to a native runner (`linux/amd64` → `ubuntu-latest`, `linux/arm64` → `ubuntu-24.04-arm`) and emits the build matrix; an unsupported, repeated or empty platform list fails here. Nothing is ever emulated.
+2. **`build` job** (a matrix, one leg per platform; `permissions: {contents: read}`, no `id-token`): each leg, on its own architecture: checkout → verify `OP_SERVICE_ACCOUNT_TOKEN` present → load Scaleway registry push credentials from 1Password (`op://monadial-cloud/scw-registry-push-ci/credentials/*`) → `docker login` → `docker buildx build` locally (`push: false, load: true`) → **Trivy scan gate** (`--severity HIGH,CRITICAL --exit-code 1`, fixable findings only; the leg stops here, nothing is ever pushed unscanned) → `docker push` of the loaded tag (the exact scanned bytes) → resolve the pushed digest (`docker pull` + `docker inspect` RepoDigests, not the tag) into a per-arch output (`digest_amd64`, `digest_arm64`). A multi-arch leg pushes `<tag>-<arch>`; a single-platform leg pushes `<tag>` itself.
+3. **`publish` job** (`permissions: {id-token: write}`, the only job that signs): verify `OP_SERVICE_ACCOUNT_TOKEN` present → load registry credentials → `docker login` → with one platform, take that leg's digest; with two, `docker buildx imagetools create` the index `<tag>` from the legs' digests and **refuse it unless it holds exactly the scanned leg digests** (an extra manifest, such as an attestation, would otherwise be signed unscanned) → install cosign → **`cosign sign --yes <image>@<digest>`** for every digest (the index and each leg), keyless (identity = this job's OIDC token), Rekor bundle included by default so admission verification is offline-capable → offline verify → the same sign and verify again with cosign v2.5.3 (legacy format, Kyverno-vendored-cosign compatibility) → check each legacy `.sig` tag's shape.
+4. **`writeback` job** (`needs: publish`; skipped when `writeback` is false; `permissions: {contents: read}`; see note below): verify `OP_SERVICE_ACCOUNT_TOKEN` present → load the GitHub App credentials from 1Password → mint a short-lived App installation token scoped to `writeback_repo` only (`actions/create-github-app-token`) → checkout `writeback_repo` with that token → `sed -E -i` the digest line matched by `writeback_regex` (refusing to proceed if the regex matched nothing) → commit `ci: pin <image> to <digest>` (skipped as a no-op if the digest didn't actually change) → push.
 
 **Why `writeback` runs with `contents: read`, not `contents: write`:** the
 job's ambient `GITHUB_TOKEN` permission only ever governs the *calling*
@@ -175,6 +178,8 @@ actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1,
 | `sigstore/cosign-installer` | v4.1.2 | `6f9f17788090df1f26f669e9d70d6ae9567deba6` |
 | `1password/load-secrets-action` | v5.0.1 | `70062d7a876d3eb6334754fa26efd2fbd90c32f2` |
 | `actions/create-github-app-token` | v3.2.0 | `bcd2ba49218906704ab6c1aa796996da409d3eb1` |
+
+v1.1.0 adds no action: multi-arch reuses the pins above, and digests cross jobs as outputs, not artifacts.
 
 **Transitive-action note:** `aquasecurity/trivy-action` internally calls a
 SHA-pinned `aquasecurity/setup-trivy` step, and that step uses

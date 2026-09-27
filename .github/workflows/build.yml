@@ -105,6 +105,25 @@
 ## layers and history: never pass secrets through it. No change for
 ## callers that omit it.
 ##
+## v1.1.0 (2026-09-27): multi-arch. `platforms` accepts linux/amd64,
+## linux/arm64. A `plan` job maps each platform to a native runner
+## (ubuntu-latest, ubuntu-24.04-arm); the `build` job becomes a matrix whose
+## every leg runs the unchanged build -> load -> Trivy -> push flow on its own
+## architecture, so each image is scanned natively and nothing is emulated;
+## a `publish` job assembles the index with `buildx imagetools create` from
+## the legs' pushed digests, refuses an index that holds anything else, then
+## applies the same modern + legacy cosign signatures to the index AND to
+## each per-arch digest, so whichever digest a node resolves carries both.
+## Single-platform callers get the same tag, digest, signatures and
+## write-back as v1.0.10: their one leg pushes <tag> itself and publish
+## signs that digest. Build legs no longer hold id-token: write; only
+## publish signs. New boolean input `writeback` (default true) skips the
+## write-back job, so a release candidate can be dry-run from a branch.
+## Digests cross from the matrix to publish as per-arch output keys
+## (digest_amd64, digest_arm64): a leg's empty output is skipped, so the
+## legs never overwrite each other, and no artifact action (not on the org
+## allowlist) is needed.
+##
 ## Every third-party `uses:` below is pinned to a full 40-char commit SHA,
 ## with the human-readable release tag it currently resolves to as a
 ## trailing comment. Re-resolve with:
@@ -159,7 +178,10 @@ name: build
         required: true
         type: string
       platforms:
-        description: Comma-separated buildx platform list. Single-platform only (load+push flow).
+        description: >-
+          Comma-separated platform list: linux/amd64, linux/arm64, or both.
+          Each platform builds on its own native runner (v1.1.0); two build
+          an index signed alongside its per-arch images.
         required: false
         type: string
         default: linux/amd64
@@ -179,6 +201,13 @@ name: build
         required: false
         type: string
         default: ""
+      writeback:
+        description: >-
+          Pin the digest into writeback_path. false builds, scans, pushes and
+          signs without writing anything back (a dry run from a branch).
+        required: false
+        type: boolean
+        default: true
     secrets:
       OP_SERVICE_ACCOUNT_TOKEN:
         description: >-
@@ -192,21 +221,73 @@ name: build
     outputs:
       digest:
         description: sha256 digest of the pushed, signed image.
-        value: ${{ jobs.build.outputs.digest }}
+        value: ${{ jobs.publish.outputs.digest }}
 
 # Hygiene default (§11.4): no ambient token permissions anywhere in this
 # workflow unless a job explicitly grants itself what it needs.
 permissions: {}
 
 jobs:
-  build:
-    name: build, scan, push, sign
+  plan:
+    name: plan platforms
     runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      arches: ${{ steps.plan.outputs.arches }}
+      multi: ${{ steps.plan.outputs.multi }}
+    steps:
+      - name: Map platforms to native runners
+        id: plan
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          entries=""
+          arches=""
+          for raw in $(printf '%s' "${PLATFORMS}" | tr ',' ' '); do
+            case "${raw}" in
+              linux/amd64) runner=ubuntu-latest; arch=amd64 ;;
+              linux/arm64) runner=ubuntu-24.04-arm; arch=arm64 ;;
+              *)
+                echo "::error::unsupported platform '${raw}' (supported: linux/amd64, linux/arm64)" >&2
+                exit 1
+                ;;
+            esac
+            case " ${arches} " in
+              *" ${arch} "*)
+                echo "::error::platform '${raw}' is listed twice" >&2
+                exit 1
+                ;;
+            esac
+            arches="${arches}${arches:+ }${arch}"
+            entries="${entries}${entries:+,}{\"platform\":\"${raw}\",\"runner\":\"${runner}\",\"arch\":\"${arch}\"}"
+          done
+          if [ -z "${arches}" ]; then
+            echo "::error::platforms is empty" >&2
+            exit 1
+          fi
+          echo "matrix={\"include\":[${entries}]}" >> "$GITHUB_OUTPUT"
+          echo "arches=${arches}" >> "$GITHUB_OUTPUT"
+          case "${arches}" in
+            *" "*) echo "multi=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "multi=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  build:
+    name: build, scan, push (${{ matrix.platform }})
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     permissions:
-      id-token: write  # cosign keyless: mints the OIDC token Fulcio exchanges for a cert
       contents: read  # actions/checkout of the calling repo
     outputs:
-      digest: ${{ steps.digest.outputs.digest }}
+      # One key per architecture: a leg leaves the other key empty, and an
+      # empty matrix output is skipped rather than written over a sibling's.
+      digest_amd64: ${{ steps.digest.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.digest.outputs.digest_arm64 }}
     steps:
       - name: Checkout calling repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -235,11 +316,16 @@ jobs:
         id: vars
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          MULTI: ${{ needs.plan.outputs.multi }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          if [ -n "${INPUT_TAG}" ]; then
-            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          if [ -n "${INPUT_TAG}" ]; then base="${INPUT_TAG}"; else base="${GITHUB_SHA}"; fi
+          # A multi-arch leg pushes <tag>-<arch>; publish owns <tag> (the
+          # index). A single-platform leg pushes <tag> itself, as v1.0.10 did.
+          if [ "${MULTI}" = "true" ]; then
+            echo "tag=${base}-${ARCH}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "tag=${base}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Docker login (Scaleway registry)
@@ -257,7 +343,7 @@ jobs:
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
-          platforms: ${{ inputs.platforms }}
+          platforms: ${{ matrix.platform }}
           push: false
           load: true
           tags: ${{ inputs.image }}:${{ steps.vars.outputs.tag }}
@@ -290,6 +376,7 @@ jobs:
         env:
           IMAGE: ${{ inputs.image }}
           TAG: ${{ steps.vars.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
         run: |
           # Pull (rather than trust the local buildx load) so the local
           # daemon records RepoDigests against a reference it fetched from
@@ -300,7 +387,97 @@ jobs:
             echo "::error::Could not resolve a pushed digest for ${IMAGE}:${TAG} — RepoDigests empty after pull." >&2
             exit 1
           fi
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "digest_${ARCH}=${digest}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: index, sign
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # cosign keyless: mints the OIDC token Fulcio exchanges for a cert
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN}" ]; then
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN org secret is missing or empty." >&2
+            echo "This workflow needs it to authenticate to 1Password (vault monadial-cloud)." >&2
+            echo "See WORKFLOWS.md prerequisite 3 — ask an org admin to share the org secret with this repo." >&2
+            exit 1
+          fi
+
+      - name: Load registry push credentials from 1Password
+        uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
+        with:
+          export-env: true
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          SCW_ACCESS_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/access_key
+          SCW_SECRET_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/secret_key
+
+      - name: Docker login (Scaleway registry)
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          registry="${IMAGE%%/*}"
+          echo "${SCW_SECRET_KEY}" | docker login "${registry}" --username "${SCW_ACCESS_KEY}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Assemble the index (multi-arch) or take the single digest
+        id: index
+        env:
+          IMAGE: ${{ inputs.image }}
+          INPUT_TAG: ${{ inputs.tag }}
+          ARCHES: ${{ needs.plan.outputs.arches }}
+          MULTI: ${{ needs.plan.outputs.multi }}
+          DIGEST_AMD64: ${{ needs.build.outputs.digest_amd64 }}
+          DIGEST_ARM64: ${{ needs.build.outputs.digest_arm64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG}" ]; then tag="${INPUT_TAG}"; else tag="${GITHUB_SHA}"; fi
+          legs=""
+          for arch in ${ARCHES}; do
+            case "${arch}" in
+              amd64) d="${DIGEST_AMD64}" ;;
+              arm64) d="${DIGEST_ARM64}" ;;
+            esac
+            if ! printf '%s' "${d}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+              echo "::error::no valid digest from the ${arch} leg (got '${d}')." >&2
+              exit 1
+            fi
+            legs="${legs}${legs:+ }${d}"
+          done
+          if [ "${MULTI}" != "true" ]; then
+            echo "digest=${legs}" >> "$GITHUB_OUTPUT"
+            echo "sign=${legs}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          refs=""
+          for d in ${legs}; do refs="${refs} ${IMAGE}@${d}"; done
+          # shellcheck disable=SC2086  # refs is a space-separated list of refs
+          docker buildx imagetools create -t "${IMAGE}:${tag}" ${refs}
+          index="$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .Manifest}}' | jq -r '.digest')"
+          if ! printf '%s' "${index}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not resolve the index digest for ${IMAGE}:${tag}." >&2
+            exit 1
+          fi
+          # The index must hold exactly the scanned leg digests, nothing more:
+          # an extra manifest (an attestation, a stale platform) would be
+          # signed by the loop below without ever having been scanned.
+          got="$(docker buildx imagetools inspect --raw "${IMAGE}@${index}" | jq -r '.manifests[].digest' | sort | tr '\n' ' ')"
+          # shellcheck disable=SC2086  # legs is a space-separated list of digests
+          want="$(printf '%s\n' ${legs} | sort | tr '\n' ' ')"
+          if [ "${got}" != "${want}" ]; then
+            echo "::error::index ${index} holds [${got}], expected exactly the scanned legs [${want}]." >&2
+            exit 1
+          fi
+          echo "digest=${index}" >> "$GITHUB_OUTPUT"
+          echo "sign=${index} ${legs}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
@@ -308,7 +485,7 @@ jobs:
       - name: Sign image (keyless)
         env:
           IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ steps.digest.outputs.digest }}
+          SIGN: ${{ steps.index.outputs.sign }}
         run: |
           # Keyless: identity = this job's OIDC token (id-token: write
           # above), Fulcio-issued short-lived cert, Rekor transparency-log
@@ -324,20 +501,23 @@ jobs:
           # always published under. Kept unchanged; the dual-publish step
           # immediately below ADDS the legacy reference on top of this,
           # it doesn't replace it.
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          # v1.1.0: every digest publish names, the index and each leg.
+          for d in ${SIGN}; do cosign sign --yes "${IMAGE}@${d}"; done
 
       - name: Verify signature offline (Rekor bundle attached — §1 requirement)
         env:
           IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ steps.digest.outputs.digest }}
+          SIGN: ${{ steps.index.outputs.sign }}
         run: |
           # Proves the just-created signature verifies WITHOUT network access
           # to Rekor (bundle embedded) — the offline-capability the cluster's
           # verifyImages admission relies on during a Sigstore outage.
-          cosign verify --offline \
-            --certificate-identity-regexp '^https://github.com/monadial/\.github/' \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${IMAGE}@${DIGEST}"
+          for d in ${SIGN}; do
+            cosign verify --offline \
+              --certificate-identity-regexp '^https://github.com/monadial/\.github/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${IMAGE}@${d}"
+          done
 
       - name: Install cosign (legacy — Kyverno-vendored-cosign compatibility)
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
@@ -348,7 +528,7 @@ jobs:
       - name: Sign image (legacy format — Kyverno-vendored-cosign compatibility)
         env:
           IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ steps.digest.outputs.digest }}
+          SIGN: ${{ steps.index.outputs.sign }}
         run: |
           # WHY a second, OLDER cosign BINARY (not another flag/reshape
           # attempt on the modern one) — full history, newest first, read
@@ -413,27 +593,29 @@ jobs:
           # Full diagnosis history:
           # gitops/platform/kyverno/policies-images.yaml (monadial-cloud
           # repo) header comment.
-          /home/runner/.cosign-legacy/cosign sign --yes "${IMAGE}@${DIGEST}"
+          for d in ${SIGN}; do /home/runner/.cosign-legacy/cosign sign --yes "${IMAGE}@${d}"; done
 
       - name: Verify legacy signature offline (Kyverno-vendored-cosign compatibility)
         env:
           IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ steps.digest.outputs.digest }}
+          SIGN: ${{ steps.index.outputs.sign }}
         run: |
           # Same offline-capability proof as the modern verify step above,
           # but using the OLD cosign binary against its OWN just-published
           # signature — gate and cluster read the exact same format this
           # way, not two different ones that happen to both currently
           # pass.
-          /home/runner/.cosign-legacy/cosign verify --offline \
-            --certificate-identity-regexp '^https://github.com/monadial/\.github/' \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "${IMAGE}@${DIGEST}"
+          for d in ${SIGN}; do
+            /home/runner/.cosign-legacy/cosign verify --offline \
+              --certificate-identity-regexp '^https://github.com/monadial/\.github/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${IMAGE}@${d}"
+          done
 
       - name: Verify legacy signature tag exists (Kyverno-vendored-cosign compatibility)
         env:
           IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ steps.digest.outputs.digest }}
+          SIGN: ${{ steps.index.outputs.sign }}
         run: |
           # Real registry round-trip proving the tag the step above
           # published is actually fetchable AND correctly shaped by the
@@ -449,26 +631,29 @@ jobs:
           # the cluster, though not the Rekor-entry-type problem itself
           # (that's only provable by the offline-verify step above and the
           # cluster's own PolicyReport).
-          sig_tag="sha256-${DIGEST#sha256:}.sig"
-          echo "Checking for legacy signature tag: ${IMAGE}:${sig_tag}"
-          manifest="$(docker manifest inspect "${IMAGE}:${sig_tag}")"
-          media_type="$(echo "${manifest}" | jq -r '.mediaType')"
           sig_annotation_jq='.layers[0].annotations."dev.cosignproject.cosign/signature" // empty'
-          sig_annotation="$(echo "${manifest}" | jq -r "${sig_annotation_jq}")"
-          echo "mediaType: ${media_type}"
-          if [ "${media_type}" != "application/vnd.oci.image.manifest.v1+json" ]; then
-            echo "::error::${IMAGE}:${sig_tag} is not a bare OCI image manifest (got mediaType=${media_type})." >&2
-            exit 1
-          fi
-          if [ -z "${sig_annotation}" ]; then
-            echo "::error::${IMAGE}:${sig_tag} layer is missing the" >&2
-            echo "::error::signature annotation Kyverno's legacy reader requires." >&2
-            exit 1
-          fi
+          for d in ${SIGN}; do
+            sig_tag="sha256-${d#sha256:}.sig"
+            echo "Checking for legacy signature tag: ${IMAGE}:${sig_tag}"
+            manifest="$(docker manifest inspect "${IMAGE}:${sig_tag}")"
+            media_type="$(echo "${manifest}" | jq -r '.mediaType')"
+            sig_annotation="$(echo "${manifest}" | jq -r "${sig_annotation_jq}")"
+            echo "mediaType: ${media_type}"
+            if [ "${media_type}" != "application/vnd.oci.image.manifest.v1+json" ]; then
+              echo "::error::${IMAGE}:${sig_tag} is not a bare OCI image manifest (got mediaType=${media_type})." >&2
+              exit 1
+            fi
+            if [ -z "${sig_annotation}" ]; then
+              echo "::error::${IMAGE}:${sig_tag} layer is missing the" >&2
+              echo "::error::signature annotation Kyverno's legacy reader requires." >&2
+              exit 1
+            fi
+          done
 
   writeback:
     name: write back pinned digest
-    needs: build
+    if: ${{ inputs.writeback }}
+    needs: publish
     runs-on: ubuntu-latest
     # NOT contents:write. contents:write on the GITHUB_TOKEN would only
     # grant push rights on the repo THIS workflow is running in (the
@@ -543,7 +728,7 @@ jobs:
           WRITEBACK_PATH: ${{ inputs.writeback_path }}
           WRITEBACK_REGEX: ${{ inputs.writeback_regex }}
           IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ needs.build.outputs.digest }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
         run: |
           # v1.0.7 SECURITY GATE — validate BEFORE the substitution.
           #
@@ -596,7 +781,7 @@ jobs:
       - name: Commit and push
         env:
           IMAGE: ${{ inputs.image }}
-          DIGEST: ${{ needs.build.outputs.digest }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
           WRITEBACK_PATH: ${{ inputs.writeback_path }}
         run: |
           if git diff --quiet -- "${WRITEBACK_PATH}"; then
