@@ -321,6 +321,13 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     permissions:
       contents: read  # actions/checkout of the calling repo
+    # GOTCHA: step-level `if:` has no `secrets` context at all — GitHub
+    # refuses to PARSE the workflow ("Unrecognized named-value: 'secrets'"),
+    # which the caller sees as a run with zero jobs. v1.1.2 shipped broken
+    # this way. Job-level `env` DOES get `secrets`, so the presence test is
+    # computed here once and the steps branch on the env value.
+    env:
+      DIRECT_REGISTRY_CREDS: ${{ secrets.SCW_ACCESS_KEY != '' }}
     outputs:
       # One key per architecture: a leg leaves the other key empty, and an
       # empty matrix output is skipped rather than written over a sibling's.
@@ -331,7 +338,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
-        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
+        if: ${{ env.DIRECT_REGISTRY_CREDS != 'true' }}
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: |
@@ -343,7 +350,7 @@ jobs:
           fi
 
       - name: Load registry push credentials from 1Password
-        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
+        if: ${{ env.DIRECT_REGISTRY_CREDS != 'true' }}
         uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
         with:
           export-env: true
@@ -352,14 +359,14 @@ jobs:
           SCW_ACCESS_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/access_key
           SCW_SECRET_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/secret_key
       - name: Use directly-provided registry credentials (1Password bypassed)
-        if: ${{ secrets.SCW_ACCESS_KEY != '' }}
+        if: ${{ env.DIRECT_REGISTRY_CREDS == 'true' }}
         env:
           A: ${{ secrets.SCW_ACCESS_KEY }}
           S: ${{ secrets.SCW_SECRET_KEY }}
         run: |
           echo "SCW_ACCESS_KEY=$A" >> "$GITHUB_ENV"
           echo "SCW_SECRET_KEY=$S" >> "$GITHUB_ENV"
-          echo "registry credentials taken from workflow secrets; 1Password skipped
+          echo "registry credentials taken from workflow secrets; 1Password skipped"
 
       - name: Determine build tag and layer cache
         id: vars
@@ -462,11 +469,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # cosign keyless: mints the OIDC token Fulcio exchanges for a cert
+    # Same reason as the build job: `secrets` does not exist in step `if:`.
+    env:
+      DIRECT_REGISTRY_CREDS: ${{ secrets.SCW_ACCESS_KEY != '' }}
     outputs:
       digest: ${{ steps.index.outputs.digest }}
     steps:
       - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
-        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
+        if: ${{ env.DIRECT_REGISTRY_CREDS != 'true' }}
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: |
@@ -478,7 +488,7 @@ jobs:
           fi
 
       - name: Load registry push credentials from 1Password
-        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
+        if: ${{ env.DIRECT_REGISTRY_CREDS != 'true' }}
         uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
         with:
           export-env: true
@@ -487,14 +497,14 @@ jobs:
           SCW_ACCESS_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/access_key
           SCW_SECRET_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/secret_key
       - name: Use directly-provided registry credentials (1Password bypassed)
-        if: ${{ secrets.SCW_ACCESS_KEY != '' }}
+        if: ${{ env.DIRECT_REGISTRY_CREDS == 'true' }}
         env:
           A: ${{ secrets.SCW_ACCESS_KEY }}
           S: ${{ secrets.SCW_SECRET_KEY }}
         run: |
           echo "SCW_ACCESS_KEY=$A" >> "$GITHUB_ENV"
           echo "SCW_SECRET_KEY=$S" >> "$GITHUB_ENV"
-          echo "registry credentials taken from workflow secrets; 1Password skipped
+          echo "registry credentials taken from workflow secrets; 1Password skipped"
 
       - name: Docker login (Scaleway registry)
         env:
@@ -745,8 +755,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # No `if` here, unlike build/publish: the direct-credentials bypass
+      # covers only the REGISTRY credentials. This job's GitHub App key
+      # still comes from 1Password unconditionally, so the token must be
+      # present even when the bypass is armed.
       - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
-        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: |
