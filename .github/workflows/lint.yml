@@ -1,0 +1,32 @@
+# Lints the reusable workflows in this repository. This repo had NO CI at
+# all, which is exactly how v1.1.2 shipped unparseable (step `if:` using the
+# `secrets` context — actionlint reports "context 'secrets' is not allowed
+# here" on that line, so this job would have refused that PR).
+#
+# actionlint is run via `go run <module>@<version>`: the Go module proxy
+# verifies the module against the public checksum database (sum.golang.org),
+# which gives a pinned, checksummed toolchain without trusting a third-party
+# action or a curl|sh installer.
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  actionlint:
+    name: actionlint
+    # ubuntu-latest, not monadial-k8s: Go is preinstalled on the hosted
+    # image, the job runs for seconds, and this repo's workflows are the
+    # supply-chain root for every org build — keeping their lint off the
+    # cluster the builds deploy to is a feature, not an oversight.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Run actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
