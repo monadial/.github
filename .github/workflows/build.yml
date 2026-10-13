@@ -245,6 +245,17 @@ name: build
           fast with an explicit ::error:: rather than a cryptic
           1Password-CLI auth failure.
         required: true
+      # Emergency bypass of 1Password: when BOTH are provided, the registry
+      # credentials come straight from these and the 1P step is skipped.
+      # Exists because 1Password rate limits are account-wide and daily —
+      # 2026-10-13 one morning's incident burned the whole day's budget and
+      # every build died at the credential read with prod waiting on a fix.
+      # Unset these repo secrets again once the budget window resets; the 1P
+      # path is the default and the audited one.
+      SCW_ACCESS_KEY:
+        required: false
+      SCW_SECRET_KEY:
+        required: false
     outputs:
       digest:
         description: sha256 digest of the pushed, signed image.
@@ -320,6 +331,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
+        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: |
@@ -331,6 +343,7 @@ jobs:
           fi
 
       - name: Load registry push credentials from 1Password
+        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
         uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
         with:
           export-env: true
@@ -338,6 +351,15 @@ jobs:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           SCW_ACCESS_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/access_key
           SCW_SECRET_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/secret_key
+      - name: Use directly-provided registry credentials (1Password bypassed)
+        if: ${{ secrets.SCW_ACCESS_KEY != '' }}
+        env:
+          A: ${{ secrets.SCW_ACCESS_KEY }}
+          S: ${{ secrets.SCW_SECRET_KEY }}
+        run: |
+          echo "SCW_ACCESS_KEY=$A" >> "$GITHUB_ENV"
+          echo "SCW_SECRET_KEY=$S" >> "$GITHUB_ENV"
+          echo "registry credentials taken from workflow secrets; 1Password skipped
 
       - name: Determine build tag and layer cache
         id: vars
@@ -444,6 +466,7 @@ jobs:
       digest: ${{ steps.index.outputs.digest }}
     steps:
       - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
+        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: |
@@ -455,6 +478,7 @@ jobs:
           fi
 
       - name: Load registry push credentials from 1Password
+        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
         uses: 1password/load-secrets-action@70062d7a876d3eb6334754fa26efd2fbd90c32f2  # v5.0.1
         with:
           export-env: true
@@ -462,6 +486,15 @@ jobs:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           SCW_ACCESS_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/access_key
           SCW_SECRET_KEY: op://monadial-cloud/scw-registry-push-ci/credentials/secret_key
+      - name: Use directly-provided registry credentials (1Password bypassed)
+        if: ${{ secrets.SCW_ACCESS_KEY != '' }}
+        env:
+          A: ${{ secrets.SCW_ACCESS_KEY }}
+          S: ${{ secrets.SCW_SECRET_KEY }}
+        run: |
+          echo "SCW_ACCESS_KEY=$A" >> "$GITHUB_ENV"
+          echo "SCW_SECRET_KEY=$S" >> "$GITHUB_ENV"
+          echo "registry credentials taken from workflow secrets; 1Password skipped
 
       - name: Docker login (Scaleway registry)
         env:
@@ -713,6 +746,7 @@ jobs:
       contents: read
     steps:
       - name: Preflight — verify OP_SERVICE_ACCOUNT_TOKEN is present
+        if: ${{ secrets.SCW_ACCESS_KEY == '' }}
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
         run: |
